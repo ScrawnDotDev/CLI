@@ -7,6 +7,7 @@ import (
 	"github.com/ScrawnDotDev/scrawn-cli/internal/ui"
 
 	_ "github.com/ScrawnDotDev/scrawn-cli/internal/commands/init"
+	_ "github.com/ScrawnDotDev/scrawn-cli/internal/commands/dev"
 )
 
 var Version = "dev"
