@@ -1,11 +1,13 @@
 package tagcmd
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -19,31 +21,15 @@ func init() {
 
 // ---- types ----
 
-type scrawnConfigData struct {
+type cliConfig struct {
+	APIKey    string `json:"apiKey"`
+	GrpcURL   string `json:"grpcUrl"`
+	HTTPURL   string `json:"httpUrl"`
 	Directory string `json:"directory"`
-	ServerURL string `json:"serverUrl"`
-}
-
-type projectConfigFile struct {
-	Scrawn scrawnConfigData `json:"scrawn"`
-}
-
-type scrawnConfig struct {
-	Directory  string
-	ServerURL  string
-	ProjectDir string
 }
 
 type tagsResponseBody struct {
 	Tags []string `json:"tags"`
-}
-
-func defaultScrawnConfig() scrawnConfig {
-	return scrawnConfig{
-		Directory:  "scrawn",
-		ServerURL:  "http://localhost:8070",
-		ProjectDir: ".",
-	}
 }
 
 // ---- command ----
@@ -90,11 +76,12 @@ func showSyncHelp() {
 	fmt.Println()
 	fmt.Println(ui.Heading.Render("Usage:") + " scrawn tag sync")
 	fmt.Println()
-	fmt.Println("Pull tags from the Scrawn server and generate scrawn/tags.ts + scrawn/biller.ts")
+	fmt.Println("Pull tags from the Scrawn server and generate scrawn/tags.ts")
 	fmt.Println()
 	fmt.Println(ui.Heading.Render("Configuration:"))
-	fmt.Println("  Reads scrawn.config.json from the project root (or uses defaults)")
-	fmt.Println("  Reads SCRAWN_KEY from the OS environment")
+	fmt.Println("  Reads scrawn.config.ts from the project root")
+	fmt.Println("  Requires bun or node+tsx to evaluate the config")
+	fmt.Println("  Environment variables are loaded from .env.local/.env automatically")
 }
 
 // ---- sync implementation ----
@@ -107,23 +94,54 @@ func runSync(args []string) error {
 		}
 	}
 
-	cfg, err := loadScrawnConfig()
+	// 1. Find scrawn.config.ts
+	configPath, configDir := findConfigFile()
+	if configPath == "" {
+		return &cmd.CommandError{
+			Summary: "config file not found",
+			Detail:  "scrawn.config.ts not found in current or parent directories. Create one with scrawnConfig({...}).",
+		}
+	}
+
+	// 2. Detect runtime (bun, or node+tsx)
+	runtime, err := detectRuntime()
 	if err != nil {
 		return &cmd.CommandError{
-			Summary: "failed to load config",
+			Summary: "no JavaScript runtime found",
+			Detail:  "bun or node with tsx is required to evaluate scrawn.config.ts. Install bun or node+tsx.",
+		}
+	}
+
+	// 3. For node: load env file so config.ts can read env vars
+	if runtime == "node" {
+		loadEnvFiles(configDir)
+	}
+
+	// 4. Evaluate scrawn.config.ts via the runtime
+	cfg, err := evalTsConfig(runtime, configPath, configDir)
+	if err != nil {
+		return &cmd.CommandError{
+			Summary: "failed to read config",
 			Detail:  err.Error(),
 		}
 	}
 
-	apiKey := os.Getenv("SCRAWN_KEY")
-	if apiKey == "" {
+	if cfg.HTTPURL == "" {
+		cfg.HTTPURL = "http://localhost:8070"
+	}
+	if cfg.Directory == "" {
+		cfg.Directory = "scrawn"
+	}
+
+	if cfg.APIKey == "" {
 		return &cmd.CommandError{
 			Summary: "API key not found",
-			Detail:  "SCRAWN_KEY is not set in the environment",
+			Detail:  "SCRAWN_KEY is not set. Make sure it is defined in your .env.local or environment.",
 		}
 	}
 
-	tags, err := fetchTagsFromServer(cfg.ServerURL, apiKey)
+	// 5. Fetch tags from server
+	tags, err := fetchTagsFromServer(cfg.HTTPURL, cfg.APIKey)
 	if err != nil {
 		return &cmd.CommandError{
 			Summary: "failed to fetch tags",
@@ -131,22 +149,12 @@ func runSync(args []string) error {
 		}
 	}
 
-	outputDir := filepath.Join(cfg.ProjectDir, cfg.Directory)
-
-	// Generate tags.ts
+	// 6. Generate tags.ts
+	outputDir := filepath.Join(configDir, cfg.Directory)
 	tagsPath := filepath.Join(outputDir, "tags.ts")
 	if err := writeTagsFile(tagsPath, tags); err != nil {
 		return &cmd.CommandError{
 			Summary: "failed to generate tags file",
-			Detail:  err.Error(),
-		}
-	}
-
-	// Generate biller.ts
-	billerPath := filepath.Join(outputDir, "biller.ts")
-	if err := writeBillerFile(billerPath, cfg.ServerURL); err != nil {
-		return &cmd.CommandError{
-			Summary: "failed to generate biller file",
 			Detail:  err.Error(),
 		}
 	}
@@ -156,48 +164,65 @@ func runSync(args []string) error {
 	return nil
 }
 
-// ---- config ----
+// ---- runtime detection ----
 
-func loadScrawnConfig() (scrawnConfig, error) {
-	cfg := defaultScrawnConfig()
-
-	configPath := findConfigFile()
-	if configPath == "" {
-		return cfg, nil
+func detectRuntime() (string, error) {
+	if _, err := exec.LookPath("bun"); err == nil {
+		return "bun", nil
 	}
-
-	cfg.ProjectDir = filepath.Dir(configPath)
-
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return cfg, fmt.Errorf("could not read %s: %w", configPath, err)
+	if _, err := exec.LookPath("node"); err == nil {
+		if _, err := exec.LookPath("tsx"); err == nil {
+			return "node", nil
+		}
+		if _, err := exec.LookPath("npx"); err == nil {
+			return "node", nil
+		}
 	}
-
-	var fileCfg projectConfigFile
-	if err := json.Unmarshal(data, &fileCfg); err != nil {
-		return cfg, fmt.Errorf("invalid config in %s: %w", configPath, err)
-	}
-
-	if fileCfg.Scrawn.Directory != "" {
-		cfg.Directory = fileCfg.Scrawn.Directory
-	}
-	if fileCfg.Scrawn.ServerURL != "" {
-		cfg.ServerURL = fileCfg.Scrawn.ServerURL
-	}
-
-	return cfg, nil
+	return "", fmt.Errorf("neither bun nor node+tsx found")
 }
 
-func findConfigFile() string {
+// ---- env file loading (for node fallback) ----
+
+func loadEnvFiles(projectDir string) {
+	for _, name := range []string{".env.local", ".env"} {
+		envPath := filepath.Join(projectDir, name)
+		f, err := os.Open(envPath)
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			val = strings.Trim(val, `"'`)
+			if os.Getenv(key) == "" {
+				os.Setenv(key, val)
+			}
+		}
+		f.Close()
+	}
+}
+
+// ---- config file resolution ----
+
+func findConfigFile() (string, string) {
 	dir, err := os.Getwd()
 	if err != nil {
-		return ""
+		return "", ""
 	}
 
 	for {
-		configPath := filepath.Join(dir, "scrawn.config.json")
+		configPath := filepath.Join(dir, "scrawn.config.ts")
 		if _, statErr := os.Stat(configPath); statErr == nil {
-			return configPath
+			return configPath, dir
 		}
 
 		parent := filepath.Dir(dir)
@@ -207,7 +232,66 @@ func findConfigFile() string {
 		dir = parent
 	}
 
-	return ""
+	return "", ""
+}
+
+// ---- config evaluation ----
+
+func evalTsConfig(runtime string, configPath string, configDir string) (cliConfig, error) {
+	var cfg cliConfig
+
+	// The eval script: import the config and print it as JSON
+	relPath, _ := filepath.Rel(configDir, configPath)
+	relPath = filepath.ToSlash(relPath)
+
+	var cmd *exec.Cmd
+
+	switch runtime {
+	case "bun":
+		script := fmt.Sprintf(
+			`import c from './%s'; console.log(JSON.stringify(c));`,
+			strings.TrimSuffix(relPath, ".ts"),
+		)
+		cmd = exec.Command("bun", "-e", script)
+		cmd.Dir = configDir
+
+	case "node":
+		// Try npx tsx first, then tsx directly
+		tsxBin := "npx"
+		tsxArgs := []string{"--yes", "tsx", "-e"}
+		if _, err := exec.LookPath("tsx"); err == nil {
+			tsxBin = "tsx"
+			tsxArgs = []string{"-e"}
+		}
+
+		script := fmt.Sprintf(
+			`import c from './%s'; console.log(JSON.stringify(c));`,
+			strings.TrimSuffix(relPath, ".ts"),
+		)
+		args := append(tsxArgs, script)
+		cmd = exec.Command(tsxBin, args...)
+		cmd.Dir = configDir
+		// Pass current env (which includes loaded .env vars)
+		cmd.Env = os.Environ()
+
+	default:
+		return cfg, fmt.Errorf("unsupported runtime: %s", runtime)
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return cfg, fmt.Errorf("could not evaluate scrawn.config.ts: %s\n%s", err, string(output))
+	}
+
+	// Parse the last line as JSON (ignore bun's debug output)
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	jsonLine := lines[len(lines)-1]
+
+	if err := json.Unmarshal([]byte(jsonLine), &cfg); err != nil {
+		return cfg, fmt.Errorf("could not parse config output: %s\n%s", err, string(output))
+	}
+
+	return cfg, nil
 }
 
 // ---- HTTP client ----
@@ -245,7 +329,7 @@ func fetchTagsFromServer(serverURL string, apiKey string) ([]string, error) {
 	return result.Tags, nil
 }
 
-// ---- file generators ----
+// ---- file generator ----
 
 func writeTagsFile(filePath string, tags []string) error {
 	dir := filepath.Dir(filePath)
@@ -284,39 +368,6 @@ func writeTagsContent(w io.Writer, tags []string) error {
 		"export type ScrawnTag = (typeof TAGS)[number];",
 		"",
 	)
-
-	_, err := io.WriteString(w, strings.Join(lines, "\n"))
-	return err
-}
-
-func writeBillerFile(filePath string, serverURL string) error {
-	dir := filepath.Dir(filePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("could not create directory %s: %w", dir, err)
-	}
-
-	f, err := os.Create(filePath)
-	if err != nil {
-		return fmt.Errorf("could not create file %s: %w", filePath, err)
-	}
-	defer f.Close()
-
-	return writeBillerContent(f, serverURL)
-}
-
-func writeBillerContent(w io.Writer, serverURL string) error {
-	lines := []string{
-		"// Generated by scrawn tag sync. Do not edit manually.",
-		"import { createScrawn } from \"@scrawn/core\";",
-		"import { TAGS } from \"./tags\";",
-		"",
-		"export const biller = createScrawn({",
-		"  apiKey: (process.env.SCRAWN_KEY || process.env.SCRAWN_API_KEY) as string,",
-		fmt.Sprintf("  baseURL: (process.env.SCRAWN_BASE_URL || %q) as string,", serverURL),
-		"  tags: TAGS,",
-		"});",
-		"",
-	}
 
 	_, err := io.WriteString(w, strings.Join(lines, "\n"))
 	return err
