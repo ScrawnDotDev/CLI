@@ -76,17 +76,18 @@ func (c *ServerCommand) Name() string     { return "server" }
 func (c *ServerCommand) Description() string { return "initialize a new Scrawn server" }
 
 type serverFlags struct {
-	pkgManager      string
-	path           string
-	userIdType     string
-	dbUrl           string
-	redisUrl        string
-	lemonApiKey     string
-	lemonStoreId   string
-	lemonVariantId  string
-	lemonWebhookSec string
-	noInteractive  bool
-	help           bool
+	pkgManager       string
+	path             string
+	userIdType       string
+	dbUrl            string
+	redisUrl         string
+	clickhouseUrl    string
+	dodoLiveKey      string
+	dodoTestKey      string
+	dodoProductID    string
+	dodoWebhookSec   string
+	noInteractive    bool
+	help             bool
 }
 
 func (c *ServerCommand) Run(ctx *cmd.Context, args []string) error {
@@ -128,13 +129,14 @@ func serverHelp() {
 	fmt.Println("  -p, --path              Server directory (default: ./scrawn-server)")
 	fmt.Println("  --user-id-type          User ID type (uuid, bigint, int)")
 	fmt.Println("  -d, --db-url            PostgreSQL connection string")
-	fmt.Println("  -r, --redis-url        Redis connection string")
-	fmt.Println("  --lemon-api-key        Lemon Squeezy API key (optional)")
-	fmt.Println("  --lemon-store-id       Lemon Squeezy store ID (optional)")
-	fmt.Println("  --lemon-variant-id    Lemon Squeezy variant ID (optional)")
-	fmt.Println("  --lemon-webhook-secret  Lemon Squeezy webhook secret (optional)")
-	fmt.Println("  --no-interactive     Exit with error if required flags missing")
-	fmt.Println("  -h, --help            Show this help")
+	fmt.Println("  -r, --redis-url         Redis connection string")
+	fmt.Println("  -c, --clickhouse-url    ClickHouse connection string")
+	fmt.Println("  --dodo-live-key         Dodo Payments live API key")
+	fmt.Println("  --dodo-test-key         Dodo Payments test API key (optional)")
+	fmt.Println("  --dodo-product-id       Dodo Payments product ID")
+	fmt.Println("  --dodo-webhook-secret   Dodo Payments webhook signing secret (optional)")
+	fmt.Println("  --no-interactive        Exit with error if required flags missing")
+	fmt.Println("  -h, --help              Show this help")
 	fmt.Println()
 	fmt.Println(heading.Render("Examples:"))
 	fmt.Println("  scrawn init server                       Interactive wizard")
@@ -170,10 +172,12 @@ func parseServerFlags(args []string) *serverFlags {
 	fs.StringVar(&flags.dbUrl, "db-url", "", "db url")
 	fs.StringVar(&flags.redisUrl, "r", "", "redis url")
 	fs.StringVar(&flags.redisUrl, "redis-url", "", "redis url")
-	fs.StringVar(&flags.lemonApiKey, "lemon-api-key", "", "lemon api key")
-	fs.StringVar(&flags.lemonStoreId, "lemon-store-id", "", "lemon store id")
-	fs.StringVar(&flags.lemonVariantId, "lemon-variant-id", "", "lemon variant id")
-	fs.StringVar(&flags.lemonWebhookSec, "lemon-webhook-secret", "", "lemon webhook secret")
+	fs.StringVar(&flags.clickhouseUrl, "c", "", "clickhouse url")
+	fs.StringVar(&flags.clickhouseUrl, "clickhouse-url", "", "clickhouse url")
+	fs.StringVar(&flags.dodoLiveKey, "dodo-live-key", "", "dodo live api key")
+	fs.StringVar(&flags.dodoTestKey, "dodo-test-key", "", "dodo test api key")
+	fs.StringVar(&flags.dodoProductID, "dodo-product-id", "", "dodo product id")
+	fs.StringVar(&flags.dodoWebhookSec, "dodo-webhook-secret", "", "dodo webhook secret")
 	fs.BoolVar(&flags.noInteractive, "no-interactive", false, "non-interactive")
 
 	fs.SetOutput(os.NewFile(1, "/dev/null"))
@@ -234,10 +238,11 @@ func buildServerConfig(flags *serverFlags) (*setup.Config, error) {
 	}
 	cfg.DatabaseURL = flags.dbUrl
 	cfg.RedisURL = flags.redisUrl
-	cfg.LemonSqueezyAPIKey = flags.lemonApiKey
-	cfg.LemonSqueezyStoreID = flags.lemonStoreId
-	cfg.LemonSqueezyVariantID = flags.lemonVariantId
-	cfg.LemonSqueezyWebhookSecret = flags.lemonWebhookSec
+	cfg.ClickhouseURL = flags.clickhouseUrl
+	cfg.DodoLiveAPIKey = flags.dodoLiveKey
+	cfg.DodoTestAPIKey = flags.dodoTestKey
+	cfg.DodoProductID = flags.dodoProductID
+	cfg.DodoWebhookSecret = flags.dodoWebhookSec
 
 	generated, genErr := setup.GenerateHMACSecret()
 	if genErr != nil {
@@ -358,10 +363,11 @@ func collectServerConfigWizard(flags *serverFlags) (*setup.Config, error) {
 			}
 			return nil
 		}},
-		{Key: "lemonAPIKey", Label: "Lemon Squeezy API Key", Description: "Optional - for payment processing", Type: ui.FieldInput, AllowBlank: true},
-		{Key: "lemonStoreID", Label: "Lemon Squeezy Store ID", Description: "Optional", Type: ui.FieldInput, AllowBlank: true},
-		{Key: "lemonVariantID", Label: "Lemon Squeezy Variant ID", Description: "Optional", Type: ui.FieldInput, AllowBlank: true},
-		{Key: "lemonWebhookSecret", Label: "Lemon Squeezy Webhook Secret", Description: "Optional", Type: ui.FieldInput, AllowBlank: true},
+		{Key: "clickhouseURL", Label: "ClickHouse URL", Description: "What's your CLICKHOUSE_URL connection string? (optional)", Type: ui.FieldInput, DefaultValue: "http://default:clickhouse@localhost:8123/scrawn", AllowBlank: true},
+		{Key: "dodoLiveKey", Label: "Dodo Live API Key", Description: "Your Dodo Payments live API key (from dashboard → Developer → API)", Type: ui.FieldInput, AllowBlank: true},
+		{Key: "dodoTestKey", Label: "Dodo Test API Key", Description: "Optional — for test-mode checkout", Type: ui.FieldInput, AllowBlank: true},
+		{Key: "dodoProductID", Label: "Dodo Product ID", Description: "Your Dodo product ID (prod_xxxxx)", Type: ui.FieldInput, AllowBlank: true},
+		{Key: "dodoWebhookSecret", Label: "Dodo Webhook Signing Secret", Description: "Optional — for verifying webhook signatures", Type: ui.FieldInput, AllowBlank: true},
 	}
 
 	values, err := ui.RunWizard("init server", "", fields)
@@ -385,10 +391,11 @@ func collectServerConfigWizard(flags *serverFlags) (*setup.Config, error) {
 	cfg.HMACSecret = generated
 	cfg.DatabaseURL = values["databaseURL"]
 	cfg.RedisURL = values["redisURL"]
-	cfg.LemonSqueezyAPIKey = values["lemonAPIKey"]
-	cfg.LemonSqueezyStoreID = values["lemonStoreID"]
-	cfg.LemonSqueezyVariantID = values["lemonVariantID"]
-	cfg.LemonSqueezyWebhookSecret = values["lemonWebhookSecret"]
+	cfg.ClickhouseURL = values["clickhouseURL"]
+	cfg.DodoLiveAPIKey = values["dodoLiveKey"]
+	cfg.DodoTestAPIKey = values["dodoTestKey"]
+	cfg.DodoProductID = values["dodoProductID"]
+	cfg.DodoWebhookSecret = values["dodoWebhookSecret"]
 
 	resolved, err := setup.ResolveTargetPath(cfg.TargetInput)
 	if err != nil {
